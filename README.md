@@ -24,6 +24,7 @@ pip install maturin
 ```
 **生产构建：**
 ```bash
+cd rust_async_event_engine_project
 maturin build --release
 pip install target/wheels/*.whl
 ```
