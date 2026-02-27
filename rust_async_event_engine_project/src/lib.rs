@@ -1,9 +1,12 @@
-//! # Event Engine RS (Fixed & Optimized)
+//! # Event Engine RS (重构版)
 //!
-//! 修复了 Arc::make_mut 在 Py<T> 上无法使用标准 Clone 的问题。
-//! 实现了手动的 Copy-On-Write 机制，确保在持有 GIL 的情况下进行克隆。
-//! **修复了 stop 时因解释器关闭导致的 Panic 问题 (使用 FFI 检查)。**
-//! **修复了编译错误：移除不存在的 PyMethod，使用稳健的 eq 比较策略。**
+//! 基于 PyO3 + Tokio 的高性能 Python 事件引擎。
+//! 
+//! ## 重构改进
+//! - 提取通用 COW 操作，消除四处重复的手动 COW 代码
+//! - 恢复指针快速路径 + Python __eq__ 的双层比较策略
+//! - 统一 handler 的增删逻辑为泛型辅助函数
+//! - 优化事件循环中的 GIL 获取粒度
 
 use chrono::Local;
 use log::{debug, error};
@@ -11,7 +14,6 @@ use parking_lot::RwLock;
 use pyo3::exceptions::PyValueError;
 use pyo3::ffi;
 use pyo3::prelude::*;
-// [修复] 移除了 use pyo3::types::PyMethod; 因为该类型未公开
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,35 +23,95 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval, Duration};
 
 // ============================================================================
-// 常量定义
+// 常量
 // ============================================================================
+
 pub const EVENT_TIMER: &str = "eTimer.";
-/// 批处理大小
 const BATCH_SIZE: usize = 64;
 
 // ============================================================================
-// 数据结构定义
+// 类型别名
 // ============================================================================
+
 type HandlerList = Arc<Vec<Py<PyAny>>>;
 type HandlerStorage = Arc<RwLock<HashMap<String, HandlerList>>>;
 type GeneralHandlerStorage = Arc<RwLock<HandlerList>>;
 
 // ============================================================================
-// 辅助函数：Handler 比较
+// COW Handler 列表操作 (消除重复)
 // ============================================================================
-/// 判定两个 Handler 是否相同
-/// 策略：
-/// 仅使用 Python 原生 eq (适用于 Bound Method 和自定义对象)
-/// 移除了指针 (as_ptr) 快速对比，完全依赖 Python 解释器的 __eq__ 逻辑
-fn is_same_handler(target: &Bound<PyAny>, current: &Bound<PyAny>) -> bool {
-    // [修改] 直接调用 eq，不进行指针预检查
-    target.eq(current).unwrap_or(false)
+
+/// 对 `Arc<Vec<Py<PyAny>>>` 执行 Copy-On-Write，返回可变引用。
+/// 当 Arc 引用计数 > 1 时，在持有 GIL 的情况下克隆整个 Vec。
+fn cow_handler_list<'a>(list_arc: &'a mut HandlerList, py: Python<'_>) -> &'a mut Vec<Py<PyAny>> {
+    if Arc::get_mut(list_arc).is_none() {
+        let cloned: Vec<Py<PyAny>> = list_arc.iter().map(|h| h.clone_ref(py)).collect();
+        *list_arc = Arc::new(cloned);
+    }
+    Arc::get_mut(list_arc).expect("COW: Arc should be unique after clone")
+}
+
+/// 向 handler 列表中添加 handler（去重）。
+fn add_handler(list_arc: &mut HandlerList, handler: Py<PyAny>, py: Python<'_>) {
+    let bound = handler.bind(py);
+    let exists = list_arc.iter().any(|h| is_same_handler(bound, h.bind(py)));
+    if exists {
+        return;
+    }
+    let list = cow_handler_list(list_arc, py);
+    list.push(handler);
+}
+
+/// 从 handler 列表中移除 handler。
+fn remove_handler(list_arc: &mut HandlerList, handler: &Py<PyAny>, py: Python<'_>) {
+    let bound = handler.bind(py);
+    let has_match = list_arc.iter().any(|h| is_same_handler(bound, h.bind(py)));
+    if !has_match {
+        return;
+    }
+    let list = cow_handler_list(list_arc, py);
+    list.retain(|h| !is_same_handler(bound, h.bind(py)));
 }
 
 // ============================================================================
-// Event 类
+// Handler 比较
 // ============================================================================
-#[pyclass(name = "Event")]
+
+/// 判定两个 handler 是否相同。
+///
+/// 策略：先用指针快速判等（覆盖同一对象的常见场景），
+/// 再回退到 Python `__eq__`（覆盖 bound method 等场景）。
+fn is_same_handler(a: &Bound<PyAny>, b: &Bound<PyAny>) -> bool {
+    if a.as_ptr() == b.as_ptr() {
+        return true;
+    }
+    a.eq(b).unwrap_or(false)
+}
+
+// ============================================================================
+// Python 解释器存活检查
+// ============================================================================
+
+/// 检查 Python 解释器是否仍在运行（用于后台线程安全退出）。
+#[inline]
+fn is_python_alive() -> bool {
+    unsafe { ffi::Py_IsInitialized() != 0 }
+}
+
+// ============================================================================
+// InternalEvent
+// ============================================================================
+
+struct InternalEvent {
+    type_: String,
+    data: Option<Py<PyAny>>,
+}
+
+// ============================================================================
+// Event
+// ============================================================================
+
+#[pyclass(name = "Event", from_py_object)]
 pub struct Event {
     #[pyo3(get, set)]
     pub type_: String,
@@ -57,17 +119,27 @@ pub struct Event {
     pub data: Option<Py<PyAny>>,
 }
 
-struct InternalEvent {
-    type_: String,
-    data: Option<Py<PyAny>>,
+impl Event {
+    /// 在已持有 GIL 的上下文中克隆。
+    fn clone_with_gil(&self, py: Python<'_>) -> Self {
+        Event {
+            type_: self.type_.clone(),
+            data: self.data.as_ref().map(|d| d.clone_ref(py)),
+        }
+    }
+
+    /// 转换为 InternalEvent（零拷贝移动语义，仅克隆 Py 引用）。
+    fn to_internal(&self, py: Python<'_>) -> InternalEvent {
+        InternalEvent {
+            type_: self.type_.clone(),
+            data: self.data.as_ref().map(|d| d.clone_ref(py)),
+        }
+    }
 }
 
 impl Clone for Event {
     fn clone(&self) -> Self {
-        Python::attach(|py| Event {
-            type_: self.type_.clone(),
-            data: self.data.as_ref().map(|d| d.clone_ref(py)),
-        })
+        Python::attach(|py| self.clone_with_gil(py))
     }
 }
 
@@ -83,7 +155,11 @@ impl Event {
     }
 
     fn __repr__(&self) -> String {
-        format!("Event(type_='{}', data={:?})", self.type_, self.data.is_some())
+        format!(
+            "Event(type_='{}', data={})",
+            self.type_,
+            if self.data.is_some() { "Some(...)" } else { "None" }
+        )
     }
 
     fn __str__(&self) -> String {
@@ -92,8 +168,9 @@ impl Event {
 }
 
 // ============================================================================
-// EventEngine 类
+// EventEngine
 // ============================================================================
+
 #[pyclass(name = "EventEngine")]
 pub struct EventEngine {
     #[pyo3(get)]
@@ -112,9 +189,8 @@ impl EventEngine {
     #[new]
     #[pyo3(signature = (interval=1))]
     fn new(interval: u64) -> PyResult<Self> {
-        let actual_interval = if interval == 0 { 1 } else { interval };
         Ok(EventEngine {
-            interval: actual_interval,
+            interval: interval.max(1),
             channel: String::new(),
             active: Arc::new(AtomicBool::new(false)),
             handlers: Arc::new(RwLock::new(HashMap::new())),
@@ -133,34 +209,24 @@ impl EventEngine {
         let (sender, receiver) = mpsc::unbounded_channel();
         self.sender = Some(sender.clone());
 
-        let active = self.active.clone();
-        let handlers = self.handlers.clone();
-        let general_handlers = self.general_handlers.clone();
-        let interval_secs = self.interval;
+        let ctx = LoopContext {
+            active: self.active.clone(),
+            handlers: self.handlers.clone(),
+            general_handlers: self.general_handlers.clone(),
+            interval_secs: self.interval,
+        };
 
         let handle = thread::spawn(move || {
-            let runtime = match Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
+            let runtime = match Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    error!("Failed to create runtime: {}", e);
+                    error!("Failed to create tokio runtime: {}", e);
                     return;
                 }
             };
-
-            runtime.block_on(async {
-                run_event_loop(
-                    active,
-                    handlers,
-                    general_handlers,
-                    receiver,
-                    sender,
-                    interval_secs,
-                ).await;
-            });
+            runtime.block_on(run_event_loop(ctx, receiver, sender));
         });
+
         self.thread_handle = Some(handle);
         Ok(())
     }
@@ -169,6 +235,7 @@ impl EventEngine {
         if !self.active.swap(false, Ordering::SeqCst) {
             return Ok(());
         }
+        // 丢弃 sender 使 receiver 端收到 None，触发循环退出
         self.sender = None;
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
@@ -181,19 +248,10 @@ impl EventEngine {
     }
 
     fn put(&self, event: &Event) -> PyResult<()> {
-        self.event_to_queue(event)
-    }
-
-    fn event_to_queue(&self, event: &Event) -> PyResult<()> {
         if !self.is_loop_running() {
             return Ok(());
         }
-        
-        let internal = Python::attach(|py| InternalEvent {
-            type_: event.type_.clone(),
-            data: event.data.as_ref().map(|d| d.clone_ref(py)),
-        });
-
+        let internal = Python::attach(|py| event.to_internal(py));
         if let Some(ref sender) = self.sender {
             if let Err(e) = sender.send(internal) {
                 error!("Failed to queue event: {}", e);
@@ -202,58 +260,24 @@ impl EventEngine {
         Ok(())
     }
 
-    // 使用 is_same_handler
     fn register(&self, type_: String, handler: Py<PyAny>) -> PyResult<()> {
         if type_.is_empty() {
-            return Err(PyValueError::new_err("Type empty"));
+            return Err(PyValueError::new_err("Type cannot be empty"));
         }
         Python::attach(|py| {
             let mut guard = self.handlers.write();
             let list_arc = guard.entry(type_).or_insert_with(|| Arc::new(Vec::new()));
-            
-            // Manual COW
-            let list = if let Some(list) = Arc::get_mut(list_arc) {
-                list
-            } else {
-                let new_vec: Vec<Py<PyAny>> = list_arc.iter().map(|h| h.clone_ref(py)).collect();
-                *list_arc = Arc::new(new_vec);
-                Arc::get_mut(list_arc).unwrap()
-            };
-
-            let bound_handler = handler.bind(py);
-            // 使用优化后的比较逻辑
-            let exists = list.iter().any(|h| {
-                is_same_handler(bound_handler, h.bind(py))
-            });
-
-            if !exists {
-                list.push(handler);
-            }
+            add_handler(list_arc, handler, py);
         });
         Ok(())
     }
 
-    // 使用 is_same_handler
     fn unregister(&self, type_: String, handler: Py<PyAny>) -> PyResult<()> {
         Python::attach(|py| {
             let mut guard = self.handlers.write();
             if let Some(list_arc) = guard.get_mut(&type_) {
-                // Manual COW
-                let list = if let Some(list) = Arc::get_mut(list_arc) {
-                    list
-                } else {
-                    let new_vec: Vec<Py<PyAny>> = list_arc.iter().map(|h| h.clone_ref(py)).collect();
-                    *list_arc = Arc::new(new_vec);
-                    Arc::get_mut(list_arc).unwrap()
-                };
-
-                let bound_handler = handler.bind(py);
-                // 使用优化后的比较逻辑保留不相同的
-                list.retain(|h| {
-                    !is_same_handler(bound_handler, h.bind(py))
-                });
-
-                if list.is_empty() {
+                remove_handler(list_arc, &handler, py);
+                if list_arc.is_empty() {
                     guard.remove(&type_);
                 }
             }
@@ -261,173 +285,137 @@ impl EventEngine {
         Ok(())
     }
 
-    // 使用 is_same_handler
     fn register_general(&self, handler: Py<PyAny>) -> PyResult<()> {
         Python::attach(|py| {
-            let mut guard = self.general_handlers.write();
-            let list_arc = &mut *guard;
-            
-            // Manual COW
-            let list = if let Some(list) = Arc::get_mut(list_arc) {
-                list
-            } else {
-                let new_vec: Vec<Py<PyAny>> = list_arc.iter().map(|h| h.clone_ref(py)).collect();
-                *list_arc = Arc::new(new_vec);
-                Arc::get_mut(list_arc).unwrap()
-            };
-
-            let bound_handler = handler.bind(py);
-            // 使用优化后的比较逻辑
-            let exists = list.iter().any(|h| {
-                is_same_handler(bound_handler, h.bind(py))
-            });
-
-            if !exists {
-                list.push(handler);
-            }
+            let guard = &mut *self.general_handlers.write();
+            add_handler(guard, handler, py);
         });
         Ok(())
     }
 
-    // 使用 is_same_handler
     fn unregister_general(&self, handler: Py<PyAny>) -> PyResult<()> {
         Python::attach(|py| {
-            let mut guard = self.general_handlers.write();
-            let list_arc = &mut *guard;
-            
-            // Manual COW
-            let list = if let Some(list) = Arc::get_mut(list_arc) {
-                list
-            } else {
-                let new_vec: Vec<Py<PyAny>> = list_arc.iter().map(|h| h.clone_ref(py)).collect();
-                *list_arc = Arc::new(new_vec);
-                Arc::get_mut(list_arc).unwrap()
-            };
-
-            let bound_handler = handler.bind(py);
-            // 使用优化后的比较逻辑
-            list.retain(|h| {
-                !is_same_handler(bound_handler, h.bind(py))
-            });
+            let guard = &mut *self.general_handlers.write();
+            remove_handler(guard, &handler, py);
         });
         Ok(())
     }
 
     fn process(&self, py: Python<'_>, event: &Event) -> PyResult<()> {
-        let specific_handlers = {
+        let specific = {
             let guard = self.handlers.read();
             guard.get(&event.type_).cloned()
         };
-        let general_handlers = {
-            self.general_handlers.read().clone()
-        };
+        let general = self.general_handlers.read().clone();
 
-        if let Some(handlers) = specific_handlers {
-            for handler in handlers.iter() {
-                if let Err(e) = handler.call1(py, (event.clone(),)) {
-                    e.print(py);
-                }
-            }
+        let py_event = event.clone_with_gil(py);
+        dispatch_to_handlers(py, &py_event, specific.as_ref().map(|v| v.as_slice()), &general);
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Handler 分发 (提取公共逻辑)
+// ============================================================================
+
+/// 将事件分发给特定 handler 列表和通用 handler 列表。
+fn dispatch_to_handlers(
+    py: Python<'_>,
+    event: &Event,
+    specific: Option<&[Py<PyAny>]>,
+    general: &[Py<PyAny>],
+) {
+    let py_obj = match Py::new(py, event.clone_with_gil(py)) {
+        Ok(obj) => obj,
+        Err(e) => {
+            e.print(py);
+            return;
         }
+    };
 
-        for handler in general_handlers.iter() {
-            if let Err(e) = handler.call1(py, (event.clone(),)) {
+    if let Some(handlers) = specific {
+        for handler in handlers {
+            if let Err(e) = handler.call1(py, (py_obj.clone_ref(py),)) {
+                error!("Specific handler error");
                 e.print(py);
             }
         }
-        Ok(())
+    }
+
+    for handler in general {
+        if let Err(e) = handler.call1(py, (py_obj.clone_ref(py),)) {
+            error!("General handler error");
+            e.print(py);
+        }
     }
 }
 
 // ============================================================================
 // 异步事件循环
 // ============================================================================
-async fn run_event_loop(
+
+/// 事件循环所需的共享上下文，减少函数参数数量。
+struct LoopContext {
     active: Arc<AtomicBool>,
     handlers: HandlerStorage,
     general_handlers: GeneralHandlerStorage,
+    interval_secs: u64,
+}
+
+async fn run_event_loop(
+    ctx: LoopContext,
     mut receiver: UnboundedReceiver<InternalEvent>,
     sender: UnboundedSender<InternalEvent>,
-    interval_secs: u64,
 ) {
-    let timer_active = active.clone();
+    // 启动定时器任务
+    let timer_active = ctx.active.clone();
     let timer_sender = sender.clone();
-    
+    let interval_secs = ctx.interval_secs;
     tokio::spawn(async move {
         run_timer(timer_active, timer_sender, interval_secs).await;
     });
 
-    let mut event_buffer = Vec::with_capacity(BATCH_SIZE);
+    let mut buf = Vec::with_capacity(BATCH_SIZE);
 
-    while active.load(Ordering::Relaxed) {
-        let first_event = tokio::select! {
+    while ctx.active.load(Ordering::Relaxed) {
+        // 等待第一个事件或超时
+        let first = tokio::select! {
             res = receiver.recv() => match res {
                 Some(e) => e,
                 None => break,
             },
-             _= tokio::time::sleep(Duration::from_millis(100)) => {
-                continue;
-            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
         };
 
-        event_buffer.push(first_event);
-        while event_buffer.len() < BATCH_SIZE {
+        // 批量收集
+        buf.push(first);
+        while buf.len() < BATCH_SIZE {
             match receiver.try_recv() {
-                Ok(e) => event_buffer.push(e),
+                Ok(e) => buf.push(e),
                 Err(_) => break,
             }
         }
 
-        if !event_buffer.is_empty() {
-            // [修复] 使用 FFI 检查解释器状态
-            if unsafe { ffi::Py_IsInitialized() } == 0 {
-                debug!("Python interpreter shutdown detected, stopping loop.");
-                break;
-            }
-
-            Python::attach(|py| {
-                for internal_event in event_buffer.drain(..) {
-                    let specific_handlers_opt = {
-                        let guard = handlers.read();
-                        guard.get(&internal_event.type_).cloned()
-                    };
-                    let general_handlers_arc = {
-                        general_handlers.read().clone()
-                    };
-
-                    let py_event = Event {
-                        type_: internal_event.type_,
-                        data: internal_event.data,
-                    };
-                    
-                    let py_event_obj = match Py::new(py, py_event) {
-                        Ok(obj) => obj,
-                        Err(e) => {
-                            e.print(py);
-                            continue;
-                        }
-                    };
-
-                    if let Some(handlers) = specific_handlers_opt {
-                        for handler in handlers.iter() {
-                            if let Err(e) = handler.call1(py, (py_event_obj.clone_ref(py),)) {
-                                error!("Handler failed");
-                                e.print(py);
-                            }
-                        }
-                    }
-
-                    if !general_handlers_arc.is_empty() {
-                        for handler in general_handlers_arc.iter() {
-                            if let Err(e) = handler.call1(py, (py_event_obj.clone_ref(py),)) {
-                                error!("General handler failed");
-                                e.print(py);
-                            }
-                        }
-                    }
-                }
-            });
+        if !is_python_alive() {
+            debug!("Python interpreter shut down, exiting event loop.");
+            break;
         }
+
+        Python::attach(|py| {
+            for ev in buf.drain(..) {
+                let specific = {
+                    let guard = ctx.handlers.read();
+                    guard.get(&ev.type_).cloned()
+                };
+                let general = ctx.general_handlers.read().clone();
+
+                let event = Event {
+                    type_: ev.type_,
+                    data: ev.data,
+                };
+                dispatch_to_handlers(py, &event, specific.as_ref().map(|v| v.as_slice()), &general);
+            }
+        });
     }
 }
 
@@ -441,38 +429,38 @@ async fn run_timer(
 
     while active.load(Ordering::Relaxed) {
         timer.tick().await;
-        if !active.load(Ordering::Relaxed) { break; }
-
-        // [修复] 使用 FFI 检查解释器状态
-        if unsafe { ffi::Py_IsInitialized() } == 0 {
-            debug!("Python interpreter shutdown detected, stopping timer.");
+        if !active.load(Ordering::Relaxed) {
+            break;
+        }
+        if !is_python_alive() {
+            debug!("Python interpreter shut down, exiting timer.");
             break;
         }
 
         let now = Local::now();
-        let success = Python::attach(|py| {
-            let datetime_str = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-            match datetime_str.into_pyobject(py) {
-                Ok(pystr) => {
-                    let event = InternalEvent {
+        let ok = Python::attach(|py| {
+            let ts = now.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+            match ts.into_pyobject(py) {
+                Ok(pystr) => sender
+                    .send(InternalEvent {
                         type_: EVENT_TIMER.to_string(),
                         data: Some(pystr.unbind().into_any()),
-                    };
-                    sender.send(event).is_ok()
-                },
-                Err(_) => false
+                    })
+                    .is_ok(),
+                Err(_) => false,
             }
         });
 
-        if !success && active.load(Ordering::Relaxed) {
-             debug!("Timer event send failed or channel closed");
+        if !ok && active.load(Ordering::Relaxed) {
+            debug!("Timer event send failed or channel closed.");
         }
     }
 }
 
 // ============================================================================
-// Python 模块定义
+// Python 模块
 // ============================================================================
+
 #[pymodule]
 fn rust_async_event_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Event>()?;
